@@ -1,0 +1,7 @@
+[rust-test]
+wifi_ssid = "FRITZ!Box Fon WLAN"
+wifi_psk = "250765H61922Susan"
+mqtt_host = "mqtt://192.168.178.65:1883"
+mqtt_user = "foxriver76"
+mqtt_pass = "test"
+mqtt_client_id = "scale"
