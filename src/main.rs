@@ -130,7 +130,7 @@ fn main() {
 
 
             let dt = PinDriver::input(peripherals.pins.gpio16).unwrap();
-            let sck = PinDriver::output(peripherals.pins.gpio2).unwrap();
+            let sck = PinDriver::output(peripherals.pins.gpio4).unwrap();
             let delay = Delay::new_default();
 
             let mut load_sensor = HX711::new(sck, dt, delay);
