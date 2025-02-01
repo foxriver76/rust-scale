@@ -1,20 +1,15 @@
 mod critical_section;
 
-use esp_idf_svc::{
-    wifi::BlockingWifi,
-    wifi::EspWifi,
-    nvs::EspDefaultNvsPartition,
-    eventloop::EspSystemEventLoop,
+use embedded_svc::mqtt::client::{
+    EventPayload::Error, EventPayload::Received, QoS,
 };
-use esp_idf_svc::hal::{
-    delay::{Delay},
-    gpio::PinDriver,
-    peripherals::Peripherals,
+use esp_idf_svc::hal::{delay::Delay, gpio::PinDriver, peripherals::Peripherals};
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, wifi::BlockingWifi, wifi::EspWifi,
 };
 
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_idf_svc::mqtt::client::*;
-use core::time::Duration;
 use loadcell::{hx711::HX711, LoadCell};
 
 /// This configuration is picked up at compile time by `build.rs` from the
@@ -55,124 +50,117 @@ fn main() {
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    let esp_wifi = EspWifi::new(
-        peripherals.modem,
-        sys_loop.clone(),
-        Some(nvs)
-    ).unwrap();
+    let esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs)).unwrap();
 
     let mut wifi_driver = BlockingWifi::wrap(esp_wifi, sys_loop).unwrap();
 
-    wifi_driver.set_configuration(&Configuration::Client(ClientConfiguration{
-        ssid: app_config.wifi_ssid.try_into().expect("Could not parse the given SSID into WiFi config"),
-        password: app_config.wifi_psk.try_into().expect("Could not parse the given password into WiFi config"),
-        ..Default::default()
-    })).unwrap();
+    wifi_driver
+        .set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: app_config
+                .wifi_ssid
+                .try_into()
+                .expect("Could not parse the given SSID into WiFi config"),
+            password: app_config
+                .wifi_psk
+                .try_into()
+                .expect("Could not parse the given password into WiFi config"),
+            ..Default::default()
+        }))
+        .unwrap();
 
     wifi_driver.start().unwrap();
     wifi_driver.connect().unwrap();
     wifi_driver.wait_netif_up().unwrap();
 
     println!("Should be connected now");
-    println!("IP info: {:?}", wifi_driver.wifi().sta_netif().get_ip_info().unwrap());
+    println!(
+        "IP info: {:?}",
+        wifi_driver.wifi().sta_netif().get_ip_info().unwrap()
+    );
 
     log::info!("Connecting to MQTT server");
     let topic = "scale-bed";
     log::info!("test {}", CONFIG.mqtt_host);
 
-    let (mut mqtt_client, mut mqtt_conn) = EspMqttClient::new(
+    /*
+        let (mut mqtt_client, mut mqtt_conn) = EspMqttClient::new(
+            CONFIG.mqtt_host,
+            &MqttClientConfiguration {
+                //client_id: Some(CONFIG.mqtt_client_id),
+                password: CONFIG
+                    .mqtt_pass
+                    .try_into()
+                    .expect("Could not parse the given password into MQTT config"),
+                username: CONFIG
+                    .mqtt_user
+                    .try_into()
+                    .expect("Could not parse the given username into MQTT config"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    */
+    let mut mqtt_client = EspMqttClient::new_cb(
         CONFIG.mqtt_host,
         &MqttClientConfiguration {
             //client_id: Some(CONFIG.mqtt_client_id),
-            password: CONFIG.mqtt_pass.try_into().expect("Could not parse the given password into MQTT config"),
-            username: CONFIG.mqtt_user.try_into().expect("Could not parse the given username into MQTT config"),
+            password: CONFIG
+                .mqtt_pass
+                .try_into()
+                .expect("Could not parse the given password into MQTT config"),
+            username: CONFIG
+                .mqtt_user
+                .try_into()
+                .expect("Could not parse the given username into MQTT config"),
             ..Default::default()
         },
-    ).unwrap();
+        move |message_event| match message_event.payload() {
+            Received { data, .. } => log::info!("Received {} bytes", data.len()),
+            Error(e) => log::warn!("Received error from MQTT: {:?}", e),
+            _ => log::info!("Received from MQTT: {:?}", message_event.payload()),
+        },
+    )
+    .unwrap();
 
-    std::thread::scope(|s| {
-        log::info!("About to start the MQTT client");
+    log::info!("About to start the MQTT client");
 
-        // Need to immediately start pumping the connection for messages, or else subscribe() and publish() below will not work
-        // Note that when using the alternative constructor - `EspMqttClient::new_cb` - you don't need to
-        // spawn a new thread, as the messages will be pumped with a backpressure into the callback you provide.
-        // Yet, you still need to efficiently process each message in the callback without blocking for too long.
-        //
-        // Note also that if you go to http://tools.emqx.io/ and then connect and send a message to topic
-        // "esp-mqtt-demo", the client configured here should receive it.
-        std::thread::Builder::new()
-            .stack_size(6000)
-            .spawn_scoped(s, move || {
-                log::info!("MQTT Listening for messages");
+    let dt = PinDriver::input(peripherals.pins.gpio16).unwrap();
+    let sck = PinDriver::output(peripherals.pins.gpio4).unwrap();
+    let delay = Delay::new_default();
 
-                while let Ok(event) = mqtt_conn.next() {
-                    log::info!("[Queue] Event: {}", event.payload());
-                }
+    let mut load_sensor = HX711::new(sck, dt, delay);
 
-                log::info!("Connection closed");
-            })
-            .unwrap();
+    log::info!("Start tare");
+    load_sensor.tare(16);
+    log::info!("Finished tare");
 
-        loop {
-            if let Err(e) = mqtt_client.subscribe(topic, QoS::AtMostOnce) {
-                log::error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
+    // factor = (real_weight - tare) / raw_measurement
+    load_sensor.set_scale(0.885);
+    log::info!("Offset: {:.0} g", load_sensor.get_offset());
+    let mut vec = Vec::new();
 
-                // Re-try in 0.5s
-                std::thread::sleep(Duration::from_millis(500));
+    loop {
+        if load_sensor.is_ready() {
+            //let reading = load_sensor.read_scaled().unwrap();
+            let reading = load_sensor.read_scaled().unwrap(); // Use this to calibrate the load cell
+            vec.push(reading);
+            // log::info!("Weight: {:.0} g", reading);
+            //log::info!("Weight scaled   : {:.0} g", reading_scaled);
+            // log::info!("Weight: {} g", reading); // Use this to get all the decimals
 
-                continue;
-            }
+            if vec.len() == 20 {
+                vec.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = vec.get(10).unwrap();
+                let payload = format!("{}", median);
 
-            log::info!("Subscribed to topic \"{topic}\"");
+                mqtt_client
+                    .publish(topic, QoS::AtMostOnce, false, payload.as_bytes())
+                    .unwrap();
 
-            // Just to give a chance of our connection to get even the first published message
-            std::thread::sleep(Duration::from_millis(500));
-
-
-            let dt = PinDriver::input(peripherals.pins.gpio16).unwrap();
-            let sck = PinDriver::output(peripherals.pins.gpio4).unwrap();
-            let delay = Delay::new_default();
-
-            let mut load_sensor = HX711::new(sck, dt, delay);
-
-            log::info!("Start tare");
-            load_sensor.tare(16);
-            log::info!("Finished tare");
-
-            // TODO: scale
-            // factor = (real_weight - tare) / raw_measurement
-            load_sensor.set_scale(-1.0);
-            log::info!("Offset: {:.0} g", load_sensor.get_offset());
-            let mut vec = Vec::new();
-
-            loop {
-                if load_sensor.is_ready() {
-                    let reading = load_sensor.read_scaled().unwrap();
-                    vec.push(reading);
-                    //let reading = load_sensor.read().unwrap(); // Use this to calibrate the load cell
-                    // log::info!("Weight: {:.0} g", reading);
-                    //log::info!("Weight scaled   : {:.0} g", reading_scaled);
-                    // log::info!("Weight: {} g", reading); // Use this to get all the decimals
-
-                    if vec.len() == 20 {
-                        vec.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        let median = vec.get(10).unwrap();
-                        let payload = format!("{}", median);
-
-                        mqtt_client.enqueue(topic, QoS::AtMostOnce, false, payload.as_bytes()).unwrap();
-
-                        log::info!("Published \"{payload}\" to topic \"{topic}\"");
-                        vec.clear();
-                    }
-
-                    // let sleep_secs = 2;
-
-                    // log::info!("Now sleeping for {sleep_secs}s...");
-                    //std::thread::sleep(Duration::from_secs(sleep_secs));
-                }
-                delay.delay_ms(5u32);
+                log::info!("Published \"{payload}\" to topic \"{topic}\"");
+                vec.clear();
             }
         }
-    })
+        delay.delay_ms(5u32);
+    }
 }
-
